@@ -228,7 +228,7 @@ function mapPedido(r){
           createdAt:tms(r.criado_em),enviadoAt:tms(r.enviado_em),recebidoAt:tms(r.entregue_em)};
 }
 function mapSku(r){ return {sku:r.id,productId:r.produto_id,produto:r.produtos?r.produtos.nome:r.produto_id,
-  cat:r.produtos?r.produtos.categoria:'',tamanho:r.tamanhos?r.tamanhos.rotulo:'',aroma:r.aromas?r.aromas.nome:'',
+  cat:r.produtos?r.produtos.categoria:'',revisar:r.produtos?!!r.produtos.revisar:false,tamanho:r.tamanhos?r.tamanhos.rotulo:'',aroma:r.aromas?r.aromas.nome:'',
   preco:r.tamanhos?Number(r.tamanhos.preco):0,qtd:r.qtd,minimo:r.minimo}; }
 function mapCliente(r){ return {id:r.id,nome:r.nome,telefone:r.telefone||'',endereco:r.endereco||'',documento:r.documento||'',sellerId:r.vendedor_id}; }
 function mapFin(r){ return {id:r.id,data:tms(r.data),tipo:r.tipo,categoria:r.categoria,descricao:r.descricao,valor:Number(r.valor),conta:r.conta_id,orderId:r.pedido_id}; }
@@ -276,7 +276,7 @@ const DB={
     const [cfg,perfis,skus,cli,forn,ped,fin,contas,comp]=await Promise.all([
       SB.from('config').select('*'),
       SB.from('perfis').select('*'),
-      SB.from('skus').select('id,qtd,minimo,produto_id, produtos(nome,categoria), tamanhos(rotulo,preco), aromas(nome)'),
+      SB.from('skus').select('id,qtd,minimo,produto_id, produtos(nome,categoria,revisar), tamanhos(rotulo,preco), aromas(nome)'),
       SB.from('clientes').select('*'),
       SB.from('fornecedores').select('*'),
       SB.from('pedidos').select('*, pedido_itens(*)'),
@@ -304,7 +304,7 @@ const DB={
     if(data) C.fin=data.map(mapFin);
   },
   async reloadSkus(){
-    const {data}=await SB.from('skus').select('id,qtd,minimo,produto_id, produtos(nome,categoria), tamanhos(rotulo,preco), aromas(nome)');
+    const {data}=await SB.from('skus').select('id,qtd,minimo,produto_id, produtos(nome,categoria,revisar), tamanhos(rotulo,preco), aromas(nome)');
     if(data) C.skus=data.map(mapSku);
   },
 
@@ -326,6 +326,23 @@ const DB={
   _addFinCache(e){ C.fin.push({id:'tmp'+Date.now(),data:Date.now(),...e}); },
   async adjustStock(skuId,delta){ const s=this.sku(skuId); if(!s) return; s.qtd=Math.max(0,s.qtd+delta); const {error}=await SB.from('skus').update({qtd:s.qtd}).eq('id',skuId); if(error) toast('Erro ao salvar estoque'); },
   async setStock(skuId,val){ const s=this.sku(skuId); if(!s) return; s.qtd=Math.max(0,val|0); await SB.from('skus').update({qtd:s.qtd}).eq('id',skuId); },
+  async reviewItem(productId, patch){ // formaliza um item novo: nome/categoria/preço/estoque + tira o "revisar"
+    // atualiza cache
+    C.skus.filter(s=>s.productId===productId).forEach(s=>{
+      if(patch.nome!=null) s.produto=patch.nome;
+      if(patch.categoria!=null) s.cat=patch.categoria;
+      if(patch.preco!=null) s.preco=Number(patch.preco);
+      if(patch.qtd!=null) s.qtd=Math.max(0,patch.qtd|0);
+      s.revisar=false;
+    });
+    const prodPatch={revisar:false};
+    if(patch.nome!=null) prodPatch.nome=patch.nome;
+    if(patch.categoria!=null) prodPatch.categoria=patch.categoria;
+    const {error}=await SB.from('produtos').update(prodPatch).eq('id',productId);
+    if(error){ toast('Erro ao salvar cadastro'); return; }
+    if(patch.preco!=null) await SB.from('tamanhos').update({preco:Number(patch.preco)}).eq('produto_id',productId);
+    if(patch.qtd!=null){ const sk=C.skus.find(s=>s.productId===productId); if(sk) await SB.from('skus').update({qtd:Math.max(0,patch.qtd|0)}).eq('id',sk.sku); }
+  },
   async addFin(e){ const tmp={id:'tmp'+Date.now(),data:e.data||Date.now(),tipo:e.tipo,categoria:e.categoria,descricao:e.descricao,valor:e.valor,conta:e.conta,orderId:null}; C.fin.push(tmp);
     const {data,error}=await SB.from('financeiro').insert({tipo:e.tipo,categoria:e.categoria,descricao:e.descricao,valor:e.valor,conta_id:e.conta,data:new Date(tmp.data).toISOString()}).select().single();
     if(error){ toast('Erro ao salvar lançamento'); } else { const i=C.fin.findIndex(x=>x.id===tmp.id); if(i>=0) C.fin[i]=mapFin(data); } },
@@ -576,26 +593,30 @@ function __wa(id,i){const o=DB.order(id);const c=DB.client(o.clientId),s=DB.sell
 }
 
 /* ---------- ESTOQUE ---------- */
-let estProd='todos',estAroma='todos',estQ='',estLow=false;
+let estProd='todos',estAroma='todos',estQ='',estLow=false,estNovos=false;
 function viewEstoque(){
   let list=DB.skus();
+  if(estNovos)list=list.filter(s=>s.revisar);
   if(estProd!=='todos')list=list.filter(s=>s.productId===estProd);
   if(estAroma!=='todos')list=list.filter(s=>s.aroma===estAroma);
   if(estLow)list=list.filter(s=>s.qtd<s.minimo);
   if(estQ){const q=estQ.toLowerCase();list=list.filter(s=>(s.produto+' '+s.tamanho+' '+s.aroma).toLowerCase().includes(q));}
   const totalItens=DB.skus().reduce((a,s)=>a+s.qtd,0);
   const valorEstoque=DB.skus().reduce((a,s)=>a+s.qtd*s.preco,0);
+  const novosN=DB.skus().filter(s=>s.revisar).length;
   return `
   <div class="grid kpis" style="grid-template-columns:repeat(3,1fr);margin-bottom:6px">
     <div class="kpi"><div class="k">Itens em estoque</div><div class="v">${num(totalItens)}</div><div class="d">${DB.skus().length} SKUs cadastrados</div></div>
     <div class="kpi"><div class="k">Valor em estoque</div><div class="v">${money(valorEstoque)}</div><div class="d">a preço de venda</div></div>
-    <div class="kpi"><div class="k">Estoque baixo</div><div class="v" style="color:${estoqueBaixo().length?'var(--danger)':'var(--ink)'}">${estoqueBaixo().length}</div><div class="d">abaixo do mínimo</div></div>
+    <div class="kpi"><div class="k">Novos a revisar</div><div class="v" style="color:${novosN?'var(--warn-ink)':'var(--ink)'}">${novosN}</div><div class="d">vendidos pelos vendedores</div></div>
   </div>
+  ${novosN&&!estNovos?`<div class="callout" style="margin-bottom:12px;display:flex;align-items:center;gap:12px"><div style="flex:1"><b>${novosN} item(ns) novo(s)</b> vendido(s) pelos vendedores aguardando seu cadastro (categoria, preço, estoque).</div><button class="btn btn-primary btn-sm" onclick="estNovos=true;render()">Revisar agora</button></div>`:''}
   <div class="toolbar">
     <div class="search"><span>🔎</span><input placeholder="Buscar SKU..." value="${esc(estQ)}" oninput="estQ=this.value;refreshEst()"></div>
     <select class="inp" onchange="estProd=this.value;render()"><option value="todos"${estProd==='todos'?' selected':''}>Todos os produtos</option>${PRODUCTS.map(p=>`<option value="${p.id}"${estProd===p.id?' selected':''}>${esc(p.nome)}</option>`).join('')}</select>
     <select class="inp" onchange="estAroma=this.value;render()"><option value="todos"${estAroma==='todos'?' selected':''}>Todos os aromas</option>${AROMAS.map(a=>`<option${estAroma===a?' selected':''}>${esc(a)}</option>`).join('')}</select>
     <button class="chip ${estLow?'active':''}" onclick="estLow=!estLow;render()">Só estoque baixo</button>
+    <button class="chip ${estNovos?'active':''}" onclick="estNovos=!estNovos;render()">Novos a revisar${novosN?' ('+novosN+')':''}</button>
   </div>
   <div class="card tbl-wrap" style="max-height:62vh;overflow-y:auto">
     <table><thead><tr><th>Produto</th><th>Tamanho</th><th>Aroma</th><th class="num">Qtd</th><th>Situação</th><th class="num">Ajuste</th></tr></thead>
@@ -605,14 +626,39 @@ function viewEstoque(){
 }
 function estRows(list){
   return list.map(s=>{const sit=s.qtd===0?'<span class="badge b-low">Zerado</span>':(s.qtd<s.minimo?'<span class="badge b-mid">Baixo</span>':'<span class="badge b-ok">OK</span>');
-    return `<tr><td class="t-strong">${esc(s.produto)}</td><td>${esc(s.tamanho)}</td><td>${esc(s.aroma)}</td>
+    const novo=s.revisar?' <span class="badge b-mid">Novo · revisar</span>':'';
+    return `<tr${s.revisar?' style="background:var(--warn-soft)"':''}><td class="t-strong">${esc(s.produto)}${novo}</td><td>${esc(s.tamanho)}</td><td>${esc(s.aroma)}</td>
       <td class="num t-strong" style="font-size:15px">${s.qtd}</td><td>${sit}</td>
-      <td class="num"><button class="btn btn-outline btn-sm" onclick="DB.adjustStock('${s.sku}',-1);refreshEst();updBadges()">−</button>
+      <td class="num">${s.revisar?`<button class="btn btn-primary btn-sm" onclick="revisarModal('${s.productId}')">Revisar</button> `:''}<button class="btn btn-outline btn-sm" onclick="DB.adjustStock('${s.sku}',-1);refreshEst();updBadges()">−</button>
       <button class="btn btn-outline btn-sm" onclick="DB.adjustStock('${s.sku}',1);refreshEst();updBadges()">+</button>
       <button class="btn btn-ghost btn-sm" onclick="entradaEstoque('${s.sku}')">Entrada</button></td></tr>`;}).join('')
     ||'<tr><td colspan="6"><div class="empty"><div class="t">Nenhum SKU encontrado</div></div></td></tr>';
 }
-function refreshEst(){let list=DB.skus();if(estProd!=='todos')list=list.filter(s=>s.productId===estProd);if(estAroma!=='todos')list=list.filter(s=>s.aroma===estAroma);if(estLow)list=list.filter(s=>s.qtd<s.minimo);if(estQ){const q=estQ.toLowerCase();list=list.filter(s=>(s.produto+' '+s.tamanho+' '+s.aroma).toLowerCase().includes(q));}const b=el('estBody');if(b)b.innerHTML=estRows(list);}
+function refreshEst(){let list=DB.skus();if(estNovos)list=list.filter(s=>s.revisar);if(estProd!=='todos')list=list.filter(s=>s.productId===estProd);if(estAroma!=='todos')list=list.filter(s=>s.aroma===estAroma);if(estLow)list=list.filter(s=>s.qtd<s.minimo);if(estQ){const q=estQ.toLowerCase();list=list.filter(s=>(s.produto+' '+s.tamanho+' '+s.aroma).toLowerCase().includes(q));}const b=el('estBody');if(b)b.innerHTML=estRows(list);}
+function revisarModal(productId){
+  const s=DB.skus().find(x=>x.productId===productId); if(!s) return;
+  const cats=[...new Set(DB.skus().map(x=>x.cat).filter(c=>c&&c!=='Novos'))];
+  openModal(`<div class="mh"><h3>Revisar item novo</h3><span class="cls" onclick="closeModal()">×</span></div><div class="mb">
+    <p class="t-sub" style="margin:0 0 12px">Item vendido por um vendedor. Ajuste o cadastro e marque como revisado.</p>
+    <div class="field"><label>Nome</label><input id="rv_nome" value="${esc(s.produto)}"></div>
+    <div class="field"><div class="row2">
+      <div><label>Categoria</label><input id="rv_cat" list="rv_cats" value="Novos" placeholder="Ex.: Velas">
+        <datalist id="rv_cats">${cats.map(c=>`<option value="${esc(c)}">`).join('')}</datalist></div>
+      <div><label>Preço (R$)</label><input id="rv_preco" type="number" step="0.01" value="${s.preco}"></div></div></div>
+    <div class="field"><label>Estoque atual (unidades)</label><input id="rv_qtd" type="number" value="${s.qtd}"></div>
+    <button class="btn btn-primary" style="width:100%" onclick="salvarRevisao('${productId}')">Salvar cadastro e concluir revisão</button>
+  </div>`);
+}
+async function salvarRevisao(productId){
+  const nome=(el('rv_nome').value||'').trim();
+  const categoria=(el('rv_cat').value||'').trim()||'Novos';
+  const preco=parseFloat(el('rv_preco').value)||0;
+  const qtd=parseInt(el('rv_qtd').value)||0;
+  if(!nome){toast('Informe o nome');return;}
+  closeModal();
+  await DB.reviewItem(productId,{nome,categoria,preco,qtd});
+  toast('Cadastro revisado ✔'); render();
+}
 function updBadges(){/* atualiza contadores da sidebar sem re-render total */ const n=el('app').querySelector('.nav');}
 function entradaEstoque(skuId){const s=DB.sku(skuId);
   openModal(`<div class="mh"><h3>Entrada de estoque</h3><span class="cls" onclick="closeModal()">×</span></div><div class="mb">

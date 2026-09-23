@@ -553,6 +553,7 @@ function viewCatalog(seller){
   <div class="topbar"><div class="logo">Catálogo</div><div class="sub" onclick="go('cart')" style="cursor:pointer">🛒 ${cartCount()} item(s)<br><span style="color:var(--brand)">${money(cartTotal())}</span></div></div>
   <div class="wrap">
     <div class="search"><span>🔎</span><input placeholder="Buscar produto..." value="${esc(searchQ)}" oninput="searchQ=this.value;refreshCatalog()"></div>
+    <button class="btn btn-outline" style="margin:4px 0 2px;justify-content:flex-start;gap:8px" onclick="novoItemForm()"><span style="font-size:18px;color:var(--brand)">＋</span> Item novo (fora do catálogo)</button>
     <div class="chips" id="chips">${cats.map(c=>`<button class="chip ${c===catFilter?'active':''}" onclick="catFilter='${esc(c)}';render()">${esc(c)}</button>`).join('')}</div>
     <div class="prod-grid" id="pgrid">${filtered.map(prodCard).join('')||'<div class="empty" style="grid-column:1/3"><div class="ic">🔍</div><div class="t">Nenhum produto encontrado</div></div>'}</div>
   </div>`;
@@ -612,7 +613,44 @@ function addToCart(id){
   go('catalog');
 }
 
-/* ---- CARRINHO / PEDIDO ---- */
+/* ---- ITEM NOVO (fora do catálogo) ---- */
+function novoItemForm(){
+  openSheet(`
+    <div class="sh-head"><h3>Item novo</h3><span class="cls" onclick="closeSheet()">×</span></div>
+    <div style="padding:0 16px">
+      <p class="t-sub" style="color:var(--muted);font-size:13px;margin:0 2px 12px">Vendeu algo que ainda não está no catálogo? Cadastre aqui na hora. Ele entra no pedido e vai para o sistema para você/o Rodolfo revisar depois.</p>
+      <div class="field"><label>Nome do item *</label><input id="ni_nome" placeholder="Ex.: Vela de Cravo 200g"></div>
+      <div class="field"><label>Preço de venda (R$) *</label><input id="ni_preco" type="number" step="0.01" inputmode="decimal" placeholder="0,00"></div>
+      <div class="field"><label>Quantidade</label>
+        <div class="qty"><button onclick="niQ=Math.max(1,(niQ||1)-1);el('ni_q').textContent=niQ">–</button><span class="n" id="ni_q">1</span><button onclick="niQ=(niQ||1)+1;el('ni_q').textContent=niQ">+</button></div>
+      </div>
+      <button class="btn btn-primary" id="niBtn" onclick="addNovoItem()">Adicionar ao pedido</button>
+      <div style="height:12px"></div>
+    </div>`);
+  niQ=1;
+}
+let niQ=1;
+async function addNovoItem(){
+  const nome=(el('ni_nome').value||'').trim();
+  const preco=parseFloat(el('ni_preco').value);
+  if(!nome){ toast('Informe o nome do item'); return; }
+  if(!preco||preco<=0){ toast('Informe o preço'); return; }
+  const qty=niQ||1;
+  const btn=el('niBtn'); btn.textContent='Cadastrando...'; btn.setAttribute('disabled','');
+  const {data:pid,error}=await SB.rpc('criar_item_avulso',{p_nome:nome,p_preco:preco});
+  if(error||!pid){ btn.textContent='Adicionar ao pedido'; btn.removeAttribute('disabled'); toast('Erro ao cadastrar item'); return; }
+  const key=pid+'|Único|Único';
+  const line=CART.find(i=>i.key===key);
+  if(line) line.qty+=qty;
+  else CART.push({key, productId:pid, nome, tamanho:'Único', aroma:'Único', preco, qty, novo:true});
+  closeSheet();
+  toast(qty+'x '+nome+' (item novo) adicionado');
+  go('catalog');
+}
+function itemLabel(i){ // exibição amigável (esconde 'Único · Único' dos itens novos)
+  if(i.novo || (i.tamanho==='Único' && i.aroma==='Único')) return '<span style="color:var(--brand-2);font-weight:700">item novo</span>';
+  return esc([i.tamanho,i.aroma].filter(Boolean).join(' · '));
+}
 function viewCart(seller){
   if(!CART.length){
     return `<div class="topbar"><button class="back" onclick="go('catalog')">‹</button><div class="logo" style="font-size:18px">Pedido atual</div></div>
@@ -625,7 +663,7 @@ function viewCart(seller){
     <div class="card pad">
       ${CART.map((i,idx)=>`<div class="cart-line">
         <img src="${prodImg(DB.product(i.productId), aromaColor(i.aroma))}">
-        <div class="li-main"><div class="t">${esc(i.nome)}</div><div class="s">${esc(i.tamanho||'')}${i.aroma?' · '+esc(i.aroma):''} · ${money(i.preco)} cada</div>
+        <div class="li-main"><div class="t">${esc(i.nome)}</div><div class="s">${itemLabel(i)} · ${money(i.preco)} cada</div>
           <div class="qty" style="margin-top:7px;transform:scale(.85);transform-origin:left"><button onclick="cartQty(${idx},-1)">–</button><span class="n">${i.qty}</span><button onclick="cartQty(${idx},1)">+</button></div>
         </div>
         <div class="li-end"><div class="val">${money(i.preco*i.qty)}</div><button class="btn-sm" style="color:var(--danger);padding:4px" onclick="cartRemove(${idx})">remover</button></div>
@@ -735,7 +773,7 @@ function waMessage(o){
   m+=`Vendedor(a): ${seller?seller.nome:''}%0A`;
   m+=`%0A*Cliente*%0A${cli?cli.nome:''}%0A${cli&&cli.telefone?('Tel: '+cli.telefone+'%0A'):''}${cli&&cli.endereco?('Entrega: '+cli.endereco+'%0A'):''}${cli&&cli.obs?('Obs: '+cli.obs+'%0A'):''}`;
   m+=`%0A*Itens*%0A`;
-  o.items.forEach(i=>{ const det=[i.tamanho,i.aroma].filter(Boolean).join(' · '); m+=`• ${i.qty}x ${i.nome}${det?(' ('+det+')'):''} — ${money(i.preco*i.qty)}%0A`; });
+  o.items.forEach(i=>{ const det=(i.tamanho==='Único'&&i.aroma==='Único')?'novo':[i.tamanho,i.aroma].filter(Boolean).join(' · '); m+=`• ${i.qty}x ${i.nome}${det?(' ('+det+')'):''} — ${money(i.preco*i.qty)}%0A`; });
   m+=`%0A*Total: ${money(o.total)}*%0A`;
   m+=`Pagamento: ${o.pagamento}%0A`;
   return m.replace(/ /g,'%20');
@@ -851,7 +889,7 @@ function viewOrderDetail(id){
     </div>
     <div class="section-title">Itens</div>
     <div class="card pad">
-      ${o.items.map(i=>{const det=[i.tamanho,i.aroma].filter(Boolean).join(' · ');return `<div class="summary"><span>${i.qty}x ${esc(i.nome)}${det?` <span style="color:var(--muted);font-size:12.5px">(${esc(det)})</span>`:''}</span><span>${money(i.preco*i.qty)}</span></div>`;}).join('')}
+      ${o.items.map(i=>{const det=itemLabel(i);return `<div class="summary"><span>${i.qty}x ${esc(i.nome)}${det?` <span style="color:var(--muted);font-size:12.5px">(${det})</span>`:''}</span><span>${money(i.preco*i.qty)}</span></div>`;}).join('')}
       <div class="summary total"><span>Total</span><b>${money(o.total)}</b></div>
       <div class="summary"><span>Pagamento</span><span>${esc(o.pagamento)}</span></div>
       ${o.status==='recebido'?'<div class="summary" style="color:var(--brand-2)"><span>Comissão</span><span style="font-weight:700">conta no total do mês</span></div>':''}
@@ -889,7 +927,7 @@ function shareReceipt(id){
   const num=(cli&&cli.telefone||'').replace(/\D/g,'');
   const numFull=num.length<=11?('55'+num):num;
   let m=`*Recibo — ${DB.settings().empresa}*%0APedido ${o.codigo}%0A%0A`;
-  o.items.forEach(i=>{ const det=[i.tamanho,i.aroma].filter(Boolean).join(' · '); m+=`• ${i.qty}x ${i.nome}${det?(' ('+det+')'):''} — ${money(i.preco*i.qty)}%0A`; });
+  o.items.forEach(i=>{ const det=(i.tamanho==='Único'&&i.aroma==='Único')?'novo':[i.tamanho,i.aroma].filter(Boolean).join(' · '); m+=`• ${i.qty}x ${i.nome}${det?(' ('+det+')'):''} — ${money(i.preco*i.qty)}%0A`; });
   m+=`%0A*Total: ${money(o.total)}*%0APagamento: ${o.pagamento}%0A%0AObrigado pela preferência! 🕯️`;
   window.open(`https://wa.me/${numFull}?text=${m.replace(/ /g,'%20')}`,'_blank');
 }
