@@ -294,6 +294,7 @@ const DB={
     C.fin=(fin.data||[]).map(mapFin);
     C.banks=(contas.data||[]).map(b=>({id:b.id,nome:b.nome,banco:b.banco,tipo:b.tipo,saldoInicial:Number(b.saldo_inicial)}));
     C.comPays=(comp.data||[]).map(c=>({id:c.id,sellerId:c.vendedor_id,valor:Number(c.valor),data:tms(c.data),referencia:c.referencia}));
+    try{ await cpLoad(); }catch(e){ CP.ok=false; }
   },
   async reloadOrders(){
     const {data}=await SB.from('pedidos').select('*, pedido_itens(*)');
@@ -361,6 +362,209 @@ const DB={
     await Promise.all([this.reloadFin()]); }
 }
 
+
+/* ============================================================================
+   CONTAS A PAGAR · FORNECEDORES (pedidos, pagamentos, saldo mês a mês)
+   Tabelas: cp_fornecedores, cp_lancamentos  (ver bhadram_contas_pagar.sql)
+   ============================================================================ */
+const CP={ok:true, forn:[], lanc:[], sel:null, tab:'mes'};
+const CP_MESES=['jan','fev','mar','abr','mai','jun','jul','ago','set','out','nov','dez'];
+function cpParse(d){ if(!d) return Date.now(); const [y,m,dd]=(''+d).slice(0,10).split('-').map(Number); return new Date(y,m-1,dd).getTime(); }
+function cpISO(ts){ const d=new Date(ts); return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
+function cpMK(ts){ const d=new Date(ts); return d.getFullYear()*12+d.getMonth(); }
+function cpMLabel(mk){ return CP_MESES[mk%12]+'/'+String(Math.floor(mk/12)).slice(2); }
+function cpMapF(r){ return {id:r.id,nome:r.nome,acrescimo:Number(r.acrescimo_mensal||0),conta:r.conta_padrao||'conta',ativo:r.ativo!==false}; }
+function cpMapL(r){ return {id:r.id,fornId:r.fornecedor_id,tipo:r.tipo,data:cpParse(r.data),codigo:r.codigo||'',valor:Number(r.valor),conta:r.conta_id||'',finId:r.financeiro_id||null,obs:r.obs||''}; }
+function cpNum(v){ if(typeof v==='number') return v; v=(''+(v||'')).trim(); if(v.includes(',')) v=v.replace(/\./g,'').replace(',','.'); return parseFloat(v)||0; }
+const r2=v=>Math.round(v*100)/100;
+
+async function cpLoad(){
+  const [f,l]=await Promise.all([SB.from('cp_fornecedores').select('*').order('criado_em'), SB.from('cp_lancamentos').select('*')]);
+  if(f.error||l.error){ CP.ok=false; return; }
+  CP.ok=true; CP.forn=(f.data||[]).map(cpMapF); CP.lanc=(l.data||[]).map(cpMapL);
+  if(!CP.sel||!CP.forn.find(x=>x.id===CP.sel)) CP.sel=(CP.forn[0]||{}).id||null;
+}
+
+/* ---------- cálculo: FIFO (pagamento quita o pedido mais antigo) + mês a mês ---------- */
+function cpCalc(fornId){
+  const forn=CP.forn.find(x=>x.id===fornId)||{acrescimo:0};
+  const L=CP.lanc.filter(x=>x.fornId===fornId);
+  const ord=(a,b)=>a.data-b.data||(a.codigo||'').localeCompare(b.codigo||'');
+  const debts=L.filter(x=>x.tipo!=='pagamento').sort(ord).map(x=>({...x,pago:0,aberto:x.valor,quitadoEm:null}));
+  const pays=L.filter(x=>x.tipo==='pagamento').sort(ord);
+  let di=0, credito=0;
+  pays.forEach(p=>{ let rest=p.valor;
+    while(rest>0.004 && di<debts.length){ const d=debts[di]; const use=Math.min(rest,d.aberto);
+      d.aberto=r2(d.aberto-use); d.pago=r2(d.pago+use); rest=r2(rest-use);
+      if(d.aberto<=0.004){ d.aberto=0; d.quitadoEm=p.data; di++; } }
+    credito=r2(credito+rest); });
+  // mês a mês
+  const nowMK=cpMK(Date.now()); const mks=L.map(x=>cpMK(x.data));
+  const months=[];
+  if(L.length){ const ini=Math.min(...mks), fim=Math.max(nowMK,...mks); let saldo=0;
+    for(let mk=ini; mk<=fim; mk++){
+      const inM=L.filter(x=>cpMK(x.data)===mk);
+      const anterior=inM.filter(x=>x.tipo==='saldo_inicial').reduce((s,x)=>s+x.valor,0);
+      const comprado=inM.filter(x=>x.tipo==='pedido').reduce((s,x)=>s+x.valor,0);
+      const pago=inM.filter(x=>x.tipo==='pagamento').reduce((s,x)=>s+x.valor,0);
+      const saldoIni=saldo;
+      const devido=saldoIni+anterior+comprado;
+      // meta: compras do mês + acréscimo combinado (nunca mais do que se deve)
+      const meta=(saldoIni>0.004||comprado>0)?Math.max(0,Math.min(devido, comprado+forn.acrescimo)):0;
+      saldo=r2(devido-pago);
+      months.push({mk,saldoIni:r2(saldoIni),anterior:r2(anterior),comprado:r2(comprado),meta:r2(meta),pago:r2(pago),dif:r2(pago-meta),saldoFim:saldo});
+    } }
+  const saldo=months.length?months[months.length-1].saldoFim:0;
+  const totalComprado=L.filter(x=>x.tipo!=='pagamento').reduce((s,x)=>s+x.valor,0);
+  const totalPago=pays.reduce((s,x)=>s+x.valor,0);
+  const atual=months.find(m=>m.mk===nowMK)||{comprado:0,meta:0,pago:0,saldoIni:saldo};
+  // previsão: pagando a meta todo mês (compras + acréscimo), o saldo cai "acréscimo" por mês
+  let quitaMK=null; if(saldo>0.004&&forn.acrescimo>0){ const faltaMes=Math.max(0,atual.meta-atual.pago); const resto=saldo-faltaMes; quitaMK=resto<=0.004?nowMK:nowMK+Math.ceil(resto/forn.acrescimo); }
+  return {forn,debts,pays,months,saldo,credito,totalComprado,totalPago,atual,quitaMK};
+}
+
+/* ---------- persistência ---------- */
+async function cpAddFin(l){ // saída no Financeiro para o pagamento
+  const forn=CP.forn.find(x=>x.id===l.fornId)||{nome:'Fornecedor'};
+  const {data,error}=await SB.from('financeiro').insert({tipo:'saida',categoria:'Fornecedores',descricao:'Pagamento '+forn.nome+(l.obs?' · '+l.obs:''),valor:l.valor,conta_id:l.conta||'conta',data:new Date(l.data+12*3600000).toISOString()}).select().single();
+  if(error){ toast('Pagamento salvo, mas não foi lançado no Financeiro'); return null; }
+  return data.id;
+}
+async function cpSave(l, lancarFin){
+  const row={fornecedor_id:l.fornId,tipo:l.tipo,data:cpISO(l.data),codigo:l.codigo||null,valor:r2(l.valor),conta_id:l.conta||null,obs:l.obs||null};
+  if(l.tipo==='pagamento'){
+    if(l.finId){ await SB.from('financeiro').update({valor:row.valor,conta_id:row.conta_id||'conta',data:new Date(l.data+12*3600000).toISOString()}).eq('id',l.finId); row.financeiro_id=l.finId; }
+    else if(lancarFin){ row.financeiro_id=await cpAddFin(l); }
+  }
+  const q=l.id? SB.from('cp_lancamentos').update(row).eq('id',l.id) : SB.from('cp_lancamentos').insert(row);
+  const {error}=await q;
+  if(error){ toast('Erro ao salvar: '+error.message); return false; }
+  await Promise.all([cpLoad(), DB.reloadFin()]); return true;
+}
+async function cpDel(id){
+  const l=CP.lanc.find(x=>x.id===id); if(!l) return;
+  const txt=l.tipo==='pagamento'?('Excluir o pagamento de '+money(l.valor)+' em '+fmtDate(l.data)+'?'+(l.finId?'\nA saída correspondente no Financeiro também será excluída.':'')):('Excluir '+(l.codigo||'o lançamento')+' de '+money(l.valor)+'?');
+  if(!confirm(txt)) return;
+  const {error}=await SB.from('cp_lancamentos').delete().eq('id',id);
+  if(error){ toast('Erro ao excluir'); return; }
+  if(l.finId) await SB.from('financeiro').delete().eq('id',l.finId);
+  await Promise.all([cpLoad(), DB.reloadFin()]); closeModal(); render(); toast('Excluído');
+}
+
+/* ---------- tela ---------- */
+function viewPagar(){
+  if(!CP.ok) return `<div class="card pad"><h3 style="font-size:20px">Contas a pagar ainda não está ativado</h3>
+    <p class="t-sub" style="margin-top:8px">Rode o arquivo <b>bhadram_contas_pagar.sql</b> no SQL Editor do Supabase e recarregue esta página.</p>
+    <button class="btn btn-primary btn-sm" style="margin-top:12px" onclick="cpLoad().then(render)">Tentar de novo</button></div>`;
+  if(!CP.forn.length) return `<div class="card pad"><h3 style="font-size:20px">Nenhum fornecedor no contas a pagar</h3>
+    <p class="t-sub" style="margin-top:8px">Cadastre o fornecedor e o combinado de pagamento (compras do mês + acréscimo).</p>
+    <button class="btn btn-primary btn-sm" style="margin-top:12px" onclick="cpFornModal()">+ Cadastrar fornecedor</button></div>`;
+  const c=cpCalc(CP.sel), f=c.forn, a=c.atual;
+  const falta=Math.max(0,r2(a.meta-a.pago));
+  const tabs=[['mes','Saldo mês a mês'],['pedidos','Pedidos ('+c.debts.length+')'],['pagamentos','Pagamentos ('+c.pays.length+')']];
+  return `
+  <div class="toolbar">
+    ${CP.forn.map(x=>`<button class="chip ${x.id===CP.sel?'active':''}" onclick="CP.sel='${x.id}';render()">${esc(x.nome)}</button>`).join('')}
+    <button class="btn btn-ghost btn-sm" onclick="cpFornModal('${f.id}')">✎ Fornecedor / combinado</button>
+    <button class="btn btn-ghost btn-sm" onclick="cpFornModal()">+ Fornecedor</button>
+    <span style="margin-left:auto;display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn btn-outline btn-sm" onclick="cpLancModal('pedido')">+ Pedido do fornecedor</button>
+      <button class="btn btn-primary btn-sm" onclick="cpLancModal('pagamento')">+ Registrar pagamento</button>
+    </span>
+  </div>
+  <div class="grid kpis">
+    <div class="kpi accent"><div class="k">Saldo devedor hoje</div><div class="v">${money(c.saldo)}</div><div class="d">${c.credito>0?'crédito a favor '+money(c.credito):'comprado '+money(c.totalComprado)+' · pago '+money(c.totalPago)}</div></div>
+    <div class="kpi"><div class="k">Meta de ${CP_MESES[new Date().getMonth()]}</div><div class="v">${money(a.meta)}</div><div class="d">compras do mês ${money(a.comprado)} + ${money(f.acrescimo)}</div></div>
+    <div class="kpi"><div class="k">Pago neste mês</div><div class="v" style="color:var(--ok)">${money(a.pago)}</div><div class="d" style="color:${falta>0?'var(--danger)':'var(--ok)'};font-weight:700">${falta>0?'falta '+money(falta):'meta do mês cumprida ✓'}</div></div>
+    <div class="kpi"><div class="k">Previsão de quitação</div><div class="v" style="font-size:24px">${c.saldo<=0.004?'Quitado ✓':(c.quitaMK!=null?cpMLabel(c.quitaMK):'—')}</div><div class="d">${c.saldo>0.004?'se pagar a meta todo mês':''}</div></div>
+  </div>
+  <div class="toolbar" style="margin-top:18px">${tabs.map(t=>`<button class="chip ${CP.tab===t[0]?'active':''}" onclick="CP.tab='${t[0]}';render()">${t[1]}</button>`).join('')}</div>
+  ${CP.tab==='mes'?cpTabMes(c):CP.tab==='pedidos'?cpTabPedidos(c):cpTabPag(c)}`;
+}
+function cpTabMes(c){
+  if(!c.months.length) return '<div class="card pad t-sub">Nenhum lançamento ainda.</div>';
+  const now=cpMK(Date.now());
+  return `<div class="card tbl-wrap"><table><thead><tr><th>Mês</th><th class="num">Saldo no início</th><th class="num">Comprado</th><th class="num">Meta (compras + ${money(c.forn.acrescimo)})</th><th class="num">Pago</th><th class="num">Diferença</th><th class="num">Saldo no fim do mês</th></tr></thead>
+  <tbody>${c.months.map(m=>`<tr${m.mk===now?' style="background:var(--warn-soft)"':''}>
+    <td class="t-strong">${cpMLabel(m.mk)}${m.mk===now?' <span class="badge b-mid">atual</span>':''}</td>
+    <td class="num">${money(m.saldoIni)}${m.anterior?`<div class="t-sub" style="font-size:11.5px">+ saldo anterior ${money(m.anterior)}</div>`:''}</td>
+    <td class="num">${m.comprado?money(m.comprado):'<span class="t-sub">—</span>'}</td>
+    <td class="num">${m.meta?money(m.meta):'<span class="t-sub">—</span>'}</td>
+    <td class="num" style="color:var(--ok)">${m.pago?money(m.pago):'<span class="t-sub">—</span>'}</td>
+    <td class="num" style="font-weight:700;color:${m.dif<-0.004?'var(--danger)':'var(--ok)'}">${m.meta||m.pago?(m.dif>0?'+':m.dif<0?'−':'')+money(Math.abs(m.dif)):''}${m.mk===now&&m.dif<0?'<div class="t-sub" style="font-size:11px;font-weight:600">mês em andamento</div>':''}</td>
+    <td class="num t-strong">${money(m.saldoFim)}</td></tr>`).join('')}
+    <tr style="border-top:2px solid var(--ink)"><td class="t-strong" colspan="6">SALDO FINAL (devedor hoje)</td><td class="num t-strong" style="font-size:16px">${money(c.saldo)}</td></tr>
+  </tbody></table></div>
+  <p class="t-sub" style="margin:10px 4px">Diferença = pago − meta. Vermelho: pagou menos que o combinado no mês. Pagamentos sempre quitam primeiro o pedido mais antigo.</p>`;
+}
+function cpTabPedidos(c){
+  const list=c.debts.slice().reverse();
+  return `<div class="toolbar"><button class="btn btn-ghost btn-sm" onclick="cpLancModal('saldo_inicial')">+ Saldo anterior (dívida antiga)</button></div>
+  <div class="card tbl-wrap"><table><thead><tr><th>Data</th><th>Pedido</th><th class="num">Valor</th><th class="num">Pago</th><th class="num">Em aberto</th><th>Situação</th><th></th></tr></thead>
+  <tbody>${list.length?list.map(d=>{const st=d.aberto<=0?`<span class="badge b-pago">Quitado ${fmtDay(d.quitadoEm)}</span>`:d.pago>0?'<span class="badge b-mid">Parcial</span>':'<span class="badge b-low">Em aberto</span>';
+    return `<tr><td class="t-sub">${fmtDate(d.data)}</td><td class="t-strong">${esc(d.codigo||'—')}${d.tipo==='saldo_inicial'?' <span class="badge b-novo">saldo anterior</span>':''}${d.obs?`<div class="t-sub" style="font-size:11.5px;font-weight:500">${esc(d.obs)}</div>`:''}</td>
+    <td class="num">${money(d.valor)}</td><td class="num" style="color:var(--ok)">${d.pago?money(d.pago):'—'}</td><td class="num t-strong">${d.aberto?money(d.aberto):'—'}</td><td>${st}</td>
+    <td class="num"><button class="btn btn-outline btn-sm" onclick="cpLancModal('${d.tipo}','${d.id}')">editar</button></td></tr>`;}).join(''):'<tr><td colspan="7" class="t-sub">Nenhum pedido.</td></tr>'}</tbody></table></div>`;
+}
+function cpTabPag(c){
+  const list=c.pays.slice().reverse();
+  return `<div class="card tbl-wrap"><table><thead><tr><th>Data</th><th class="num">Valor</th><th>Conta</th><th>Observação</th><th>Financeiro</th><th></th></tr></thead>
+  <tbody>${list.length?list.map(p=>{const bk=DB.banks().find(b=>b.id===p.conta);
+    return `<tr><td class="t-sub">${fmtDate(p.data)}</td><td class="num t-strong" style="color:var(--ok)">${money(p.valor)}</td><td class="t-sub">${esc(bk?bk.nome:(p.conta||'—'))}</td><td class="t-sub">${esc(p.obs||'')}</td>
+    <td>${p.finId?'<span class="badge b-ok">lançado</span>':'<span class="t-sub">—</span>'}</td>
+    <td class="num"><button class="btn btn-outline btn-sm" onclick="cpLancModal('pagamento','${p.id}')">editar</button></td></tr>`;}).join(''):'<tr><td colspan="6" class="t-sub">Nenhum pagamento registrado.</td></tr>'}</tbody></table></div>`;
+}
+
+/* ---------- formulários ---------- */
+function cpLancModal(tipo,id){
+  const l=id?CP.lanc.find(x=>x.id===id):null; const f=CP.forn.find(x=>x.id===CP.sel);
+  const T={pedido:'Pedido do fornecedor',pagamento:'Pagamento ao fornecedor',saldo_inicial:'Saldo anterior (dívida antiga)'}[tipo];
+  const val=l?String(l.valor.toFixed(2)).replace('.',','):'';
+  openModal(`<div class="mh"><h3>${l?'Editar':'Novo'}: ${T}</h3><span class="cls" onclick="closeModal()">×</span></div><div class="mb">
+    <p class="t-sub" style="margin:0 0 12px">${esc(f?f.nome:'')}</p>
+    <div class="field"><div class="row2">
+      <div><label>Data</label><input id="cpD" type="date" value="${cpISO(l?l.data:Date.now())}"></div>
+      <div><label>Valor (R$)</label><input id="cpV" inputmode="decimal" placeholder="0,00" value="${val}"></div></div></div>
+    ${tipo!=='pagamento'?`<div class="field"><label>Nº do pedido</label><input id="cpC" placeholder="Ex.: BA-0167" value="${esc(l?l.codigo:'')}"></div>`:
+      `<div class="field"><label>Conta de saída</label><select id="cpK">${DB.banks().map(b=>`<option value="${b.id}" ${(l?l.conta:f.conta)===b.id?'selected':''}>${esc(b.nome)}</option>`).join('')}</select></div>
+       ${l&&l.finId?'<p class="t-sub" style="margin:-4px 0 12px">Já lançado no Financeiro — ao salvar, a saída é atualizada junto.</p>':
+       `<label style="display:flex;gap:8px;align-items:center;margin:0 0 14px;font-size:13.5px;font-weight:600"><input id="cpF" type="checkbox" checked style="width:auto"> Lançar saída no Financeiro</label>`}`}
+    <div class="field"><label>Observação</label><input id="cpO" placeholder="opcional" value="${esc(l?l.obs:'')}"></div>
+    <button class="btn btn-primary" style="width:100%" id="cpBtn" onclick="cpSalvarLanc('${tipo}','${id||''}')">Salvar</button>
+    ${l?`<button class="btn btn-ghost" style="width:100%;margin-top:8px;color:var(--danger)" onclick="cpDel('${l.id}')">Excluir</button>`:''}
+  </div>`);
+  setTimeout(()=>{const v=el('cpV'); if(v) v.focus();},50);
+}
+async function cpSalvarLanc(tipo,id){
+  const valor=cpNum(el('cpV').value), d=el('cpD').value;
+  if(!d||valor<=0){ toast('Informe data e valor'); return; }
+  const old=id?CP.lanc.find(x=>x.id===id):null;
+  const l={id:id||null,fornId:CP.sel,tipo,data:cpParse(d),valor,codigo:el('cpC')?el('cpC').value.trim():'',conta:el('cpK')?el('cpK').value:'',obs:el('cpO').value.trim(),finId:old?old.finId:null};
+  el('cpBtn').setAttribute('disabled',''); el('cpBtn').textContent='Salvando…';
+  const ok=await cpSave(l, el('cpF')?el('cpF').checked:false);
+  if(ok){ closeModal(); render(); toast(tipo==='pagamento'?'Pagamento registrado':'Lançamento salvo'); }
+  else { el('cpBtn').removeAttribute('disabled'); el('cpBtn').textContent='Salvar'; }
+}
+function cpFornModal(id){
+  const f=id?CP.forn.find(x=>x.id===id):null;
+  openModal(`<div class="mh"><h3>${f?'Editar fornecedor':'Novo fornecedor'}</h3><span class="cls" onclick="closeModal()">×</span></div><div class="mb">
+    <div class="field"><label>Nome</label><input id="cfN" value="${esc(f?f.nome:'')}"></div>
+    <div class="field"><div class="row2">
+      <div><label>Acréscimo mensal (R$)</label><input id="cfA" inputmode="decimal" value="${f?String(f.acrescimo.toFixed(2)).replace('.',','):'1000,00'}"></div>
+      <div><label>Conta padrão de pagamento</label><select id="cfK">${DB.banks().map(b=>`<option value="${b.id}" ${(f?f.conta:'conta')===b.id?'selected':''}>${esc(b.nome)}</option>`).join('')}</select></div></div></div>
+    <p class="t-sub" style="margin:-2px 0 14px">Combinado: todo mês pagar o valor das compras do mês + o acréscimo, para ir baixando o saldo.</p>
+    <button class="btn btn-primary" style="width:100%" onclick="cpSalvarForn('${id||''}')">Salvar</button>
+  </div>`);
+}
+async function cpSalvarForn(id){
+  const nome=el('cfN').value.trim(); if(!nome){ toast('Informe o nome'); return; }
+  const row={nome,acrescimo_mensal:cpNum(el('cfA').value),conta_padrao:el('cfK').value};
+  const q=id?SB.from('cp_fornecedores').update(row).eq('id',id):SB.from('cp_fornecedores').insert(row).select().single();
+  const {data,error}=await q; if(error){ toast('Erro: '+error.message); return; }
+  if(!id&&data) CP.sel=data.id;
+  await cpLoad(); closeModal(); render(); toast('Fornecedor salvo');
+}
+
 /* ---------- Cálculos derivados ---------- */
 function bankSaldo(bankId){ const b=DB.banks().find(x=>x.id===bankId); let s=b?b.saldoInicial:0;
   DB.fin().forEach(f=>{ if(f.conta===bankId) s+=(f.tipo==='entrada'?f.valor:-f.valor); }); return s; }
@@ -397,6 +601,7 @@ const NAV=[
  {id:'banco',lb:'Banco',ic:'<path d="M3 10l9-6 9 6M5 10v9h14v-9M9 19v-5h6v5"/>'},
  {id:'clientes',lb:'Clientes',ic:'<circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 4-6 8-6s8 2 8 6"/>'},
  {id:'fornecedores',lb:'Fornecedores',ic:'<path d="M3 13l2-7h14l2 7M3 13v6h18v-6M3 13h18"/><circle cx="7.5" cy="19.5" r="1.2"/><circle cx="16.5" cy="19.5" r="1.2"/>'},
+ {id:'pagar',lb:'Contas a pagar',ic:'<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18M7 15h4"/>'},
  {id:'comissoes',lb:'Comissões',ic:'<path d="M12 2v20M5 6h9a3 3 0 0 1 0 6H7a3 3 0 0 0 0 6h9"/>'}
 ];
 function go(v){view=v;render();window.scrollTo(0,0);closeAll();}
@@ -464,7 +669,7 @@ function maybeRender(){
   if(el('drawer').classList.contains('show')||el('modal').classList.contains('show')) return;
   render();
 }
-const TITLES={dash:['Visão geral','Resumo do seu negócio'],pedidos:['Pedidos','Pedidos recebidos dos vendedores'],estoque:['Estoque','Controle por produto, tamanho e aroma'],financeiro:['Financeiro','Fluxo de caixa, entradas e saídas'],banco:['Banco','Contas e saldos'],clientes:['Clientes','Base de clientes'],fornecedores:['Fornecedores','Seus fornecedores de insumos'],comissoes:['Comissões','Apuração por vendedor']};
+const TITLES={dash:['Visão geral','Resumo do seu negócio'],pedidos:['Pedidos','Pedidos recebidos dos vendedores'],estoque:['Estoque','Controle por produto, tamanho e aroma'],financeiro:['Financeiro','Fluxo de caixa, entradas e saídas'],banco:['Banco','Contas e saldos'],clientes:['Clientes','Base de clientes'],fornecedores:['Fornecedores','Seus fornecedores de insumos'],comissoes:['Comissões','Apuração por vendedor'],pagar:['Contas a pagar','Pedidos e pagamentos aos fornecedores']};
 
 function render(){
   if(!C.seller){ el('app').innerHTML=viewLogin(); return; }
@@ -478,6 +683,7 @@ function render(){
   else if(view==='clientes')body=viewClientes();
   else if(view==='fornecedores')body=viewFornecedores();
   else if(view==='comissoes')body=viewComissoes();
+  else if(view==='pagar')body=viewPagar();
   el('app').innerHTML=sidebar()+`<div class="main">
     <div class="topbar"><div><h1>${t[0]}</h1></div><div class="sub">${t[1]}</div>
       <div class="right"><div class="date">${new Date().toLocaleDateString('pt-BR',{weekday:'long',day:'2-digit',month:'long'})}</div>
@@ -679,6 +885,7 @@ function viewFinanceiro(){
     <div class="kpi"><div class="k">Saídas (30d)</div><div class="v" style="color:var(--danger)">${money(totalSaidas(from))}</div></div>
     <div class="kpi"><div class="k">A receber</div><div class="v">${money(contasReceber())}</div><div class="d">pedidos não pagos</div></div>
   </div>
+  ${CP.ok&&CP.forn.length?`<div class="card pad" style="margin-top:14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;cursor:pointer" onclick="go('pagar')"><div><div class="t-sub" style="font-weight:700">A pagar a fornecedores</div><div style="font-family:'Cormorant Garamond',serif;font-size:26px;font-weight:700;color:var(--danger)">${money(CP.forn.reduce((s,f)=>s+cpCalc(f.id).saldo,0))}</div></div><span class="btn btn-outline btn-sm" style="margin-left:auto">Abrir contas a pagar →</span></div>`:''}
   <div class="toolbar" style="margin-top:16px">
     <button class="chip ${finFilter==='todos'?'active':''}" onclick="finFilter='todos';render()">Tudo</button>
     <button class="chip ${finFilter==='entrada'?'active':''}" onclick="finFilter='entrada';render()">Entradas</button>
